@@ -1,0 +1,5 @@
+semfocus-*.csv
+semfocus-*.svg
+__pycache__/
+.venv/
+venv/
