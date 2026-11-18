@@ -5,12 +5,15 @@ Installation : pip install requests sentence-transformers
 Usage        : python semfocus.py https://exemple.fr
 Options      : --max 300 (pages analysées)
                --model intfloat/multilingual-e5-base (plus précis, plus lent)
+               --exclude REGEX (adresses écartées ; par défaut archives WordPress, pagination, flux)
+               --core REGEX (pages qui définissent le centre : accueil, pages produit...)
+               --z 2.5 (seuil d'écart robuste pour « loin du centre »)
 """
 import argparse, csv, gzip, html, os, re, sys, time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse, urldefrag
+from urllib.parse import unquote, urljoin, urlparse, urldefrag
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -20,6 +23,12 @@ SKIP_EXT = re.compile(r"\.(jpe?g|png|gif|webp|avif|svg|pdf|zip|rar|mp4|mp3|css|j
 SKIP_TAGS = {"script", "style", "noscript", "svg", "nav", "header", "footer", "aside", "form", "iframe", "template", "button", "select"}
 BLOCKS = {"p", "li", "h1", "h2", "h3", "h4", "h5", "h6", "td", "th", "blockquote", "pre", "div", "section", "dd", "dt", "figcaption", "br"}
 MAIN = ("main", "article")
+# Archives et listes (catégories, étiquettes, auteurs, pagination, flux, recherche) : des pages d'extraits qui
+# tombent forcément près du centre et forment de fausses paires. Remplaçable par --exclude ("" pour tout garder).
+DEFAULT_EXCLUDE = (r"/(category|categorie|categories|tag|tags|etiquette|author|auteur)/|/page/\d+/?$|/feed/?$"
+                   r"|/(wp-json|wp-admin|wp-login)|[?&](s|p|page_id|replytocom|amp)=")
+CHUNK_WORDS = 300  # e5 lit 512 tokens au plus : environ 300 mots en français, marge comprise
+MAX_CHUNKS = 12    # au-delà (≈ 3 600 mots), la suite de la page n'est pas lue
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")  # avertissement sans conséquence sous Windows
 os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 
@@ -55,6 +64,13 @@ def clean(url):
     return urldefrag(url)[0].rstrip("/")
 
 
+def same_page(a, b):
+    """Même page à http/https, www et barre finale près (pour comparer une adresse à sa canonical)."""
+    ua, ub = urlparse(clean(a)), urlparse(clean(b))
+    key = lambda u, raw: (host(raw), unquote(u.path).strip().rstrip("/"), unquote(u.query))  # %E2%80%AF == U+202F
+    return key(ua, a) == key(ub, b)
+
+
 class Page(HTMLParser):
     """Texte par blocs, sans menus, en-têtes, pieds de page ni scripts ; <main> ou <article> en priorité.
     Les blocs faits surtout de liens (listes de sujets, nuages de tags, fils d'Ariane) sont écartés."""
@@ -63,7 +79,7 @@ class Page(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.skip = self.main = self.link = 0
         self.buf, self.blocks, self.main_blocks, self.links = [], [], [], []
-        self.title, self.in_title, self.noindex, self.lang = "", False, False, ""
+        self.title, self.in_title, self.noindex, self.lang, self.canonical = "", False, False, "", ""
 
     def flush(self):
         text = " ".join("".join(t for t, _ in self.buf).split())
@@ -80,8 +96,10 @@ class Page(HTMLParser):
             self.lang = (a.get("lang") or "")[:2].lower()
         if tag == "a" and a.get("href"):
             self.links.append(a["href"])
-        if tag == "meta" and (a.get("name") or "").lower() == "robots" and "noindex" in (a.get("content") or "").lower():
+        if tag == "meta" and (a.get("name") or "").lower() in ("robots", "googlebot") and "noindex" in (a.get("content") or "").lower():
             self.noindex = True
+        if tag == "link" and "canonical" in (a.get("rel") or "").lower().split() and a.get("href") and not self.canonical:
+            self.canonical = a["href"].strip()
         if tag in BLOCKS or tag in SKIP_TAGS or tag in MAIN:
             self.flush()
         self.in_title |= tag == "title"
@@ -117,7 +135,13 @@ def fetch(url):
     p.flush()
     blocks = p.main_blocks if sum(len(b.split()) for b in p.main_blocks) >= 80 else p.blocks
     links = [clean(urljoin(r.url, l)) for l in p.links]
-    return {"url": clean(r.url), "title": " ".join(p.title.split()), "blocks": blocks, "links": links, "noindex": p.noindex, "lang": p.lang}
+    # noindex par en-tête HTTP (X-Robots-Tag), en plus de la balise meta
+    noindex = p.noindex or "noindex" in r.headers.get("X-Robots-Tag", "").lower()
+    # canonical vers une autre adresse : Google retient l'autre page, celle-ci ne compte pas
+    canonical = urljoin(r.url, p.canonical) if p.canonical else ""
+    elsewhere = bool(canonical) and not same_page(canonical, r.url)
+    return {"url": clean(r.url), "title": " ".join(p.title.split()), "blocks": blocks, "links": links,
+            "noindex": noindex, "canonical_elsewhere": elsewhere, "lang": p.lang}
 
 
 def sitemap_urls(root):
@@ -146,13 +170,16 @@ def sitemap_urls(root):
     return list(dict.fromkeys(pages))
 
 
-def collect(root, limit):
+def collect(root, limit, exclude=None):
     site = host(root)
+    excluded = (lambda u: bool(exclude.search(u))) if exclude else (lambda u: False)
     urls = [u for u in sitemap_urls(root) if host(u) == site and not SKIP_EXT.search(urlparse(u).path)]
     pages, seen = [], set()
     with ThreadPoolExecutor(4) as pool:
         if urls:
-            print(f"Sitemap : {len(urls)} adresses", end="")
+            n = len(urls)
+            urls = [u for u in urls if not excluded(u)]
+            print(f"Sitemap : {n} adresses" + (f", {n - len(urls)} exclues (archives, --exclude)" if n > len(urls) else ""), end="")
             if len(urls) > limit:  # échantillon réparti sur tout le sitemap
                 urls = [urls[int(i * len(urls) / limit)] for i in range(limit)]
                 print(f", échantillon de {limit}", end="")
@@ -162,22 +189,32 @@ def collect(root, limit):
             print("Pas de sitemap : exploration des liens internes")
             todo = [clean(root)]
             seen.add(todo[0])
-            while todo and len(pages) < limit:
+            kept = 0  # les archives sont parcourues pour trouver des liens, mais ne comptent pas dans --max
+            while todo and kept < limit:
                 batch, todo = todo[:16], todo[16:]
                 for p in pool.map(fetch, batch):
-                    if not p or len(pages) >= limit:
+                    if not p or kept >= limit:
                         continue
                     pages.append(p)
+                    kept += not excluded(p["url"])
                     for l in p["links"]:
                         if host(l) == site and l not in seen and not SKIP_EXT.search(urlparse(l).path):
                             seen.add(l)
                             todo.append(l)
     if failures:
         print("Pages non récupérées : " + ", ".join(f"{n} ({k})" for k, n in failures.items()))
-    unique = {}
+    unique, skipped = {}, Counter()
     for p in pages:
-        if not p["noindex"]:
+        if p["noindex"]:
+            skipped["noindex"] += 1
+        elif p["canonical_elsewhere"]:
+            skipped["canonical vers une autre page"] += 1
+        elif excluded(p["url"]):  # y compris une adresse du sitemap redirigée vers une archive
+            skipped["archive ou --exclude"] += 1
+        else:
             unique.setdefault(p["url"], p)
+    if skipped:
+        print("Pages écartées : " + ", ".join(f"{n} ({k})" for k, n in skipped.items()))
     return list(unique.values())
 
 
@@ -193,6 +230,22 @@ def strip_boilerplate(pages):
     limit = max(2, 0.3 * len(pages))
     for p in pages:
         p["text"] = " ".join(b for b in p["blocks"] if count[b] <= limit)
+    # Nom du site en tête ou en fin de titre (« Article - Mon site ») : commun à toutes les pages, il les rapproche
+    # toutes du centre. Retiré du texte encodé s'il revient sur plus de 30 % des pages (le titre affiché reste entier).
+    sep = re.compile(r"\s+[-|\u2013\u2014\u00b7:\u00bb]\s+")
+    ends = Counter()
+    for p in pages:
+        parts = sep.split(p["title"])
+        if len(parts) > 1:
+            ends.update({("fin", parts[-1].lower()), ("début", parts[0].lower())})
+    common = {e for e, n in ends.items() if n > limit}
+    for p in pages:
+        parts = sep.split(p["title"])
+        if len(parts) > 1 and ("fin", parts[-1].lower()) in common:
+            parts = parts[:-1]
+        if len(parts) > 1 and ("début", parts[0].lower()) in common:
+            parts = parts[1:]
+        p["topic"] = " - ".join(parts)
 
 
 def short(url, root):
@@ -237,35 +290,71 @@ def main():
     ap.add_argument("url")
     ap.add_argument("--max", type=int, default=300)
     ap.add_argument("--model", default="intfloat/multilingual-e5-small")
+    ap.add_argument("--exclude", default=DEFAULT_EXCLUDE,
+                    help="expression régulière des adresses à écarter (défaut : archives WordPress, pagination, flux ; \"\" pour tout garder)")
+    ap.add_argument("--core", default="",
+                    help="expression régulière sur le chemin des pages qui définissent le centre, ex. \"^/$|^/produits/\"")
+    ap.add_argument("--z", type=float, default=2.5,
+                    help="écart robuste (en MAD) sous la médiane à partir duquel une page est « loin du centre »")
     args = ap.parse_args()
     root = args.url if "://" in args.url else "https://" + args.url
+    exclude = re.compile(args.exclude, re.I) if args.exclude else None
+    core_re = re.compile(args.core, re.I) if args.core else None
 
-    pages = collect(root, args.max)
+    pages = collect(root, args.max, exclude)
     strip_boilerplate(pages)
     pages = [p for p in pages if len(p["text"].split()) >= 50]
     if len(pages) < 5:
         sys.exit(f"Seulement {len(pages)} pages avec assez de texte : impossible de calculer un centre.")
     print(f"{len(pages)} pages indexables d'au moins 50 mots\n")
+    is_core = np.array([bool(core_re and core_re.search(short(p["url"], root))) for p in pages])
+    if core_re:
+        if not is_core.any():
+            sys.exit(f"--core « {args.core} » ne correspond à aucune page analysée (l'expression est comparée au chemin : /, /produits/exemple...).")
+        print(f"Centre défini par {is_core.sum()} pages (--core) : " + ", ".join(short(p["url"], root) for p, c in zip(pages, is_core) if c)[:300] + "\n")
 
     from sentence_transformers import SentenceTransformer
     model = SentenceTransformer(args.model)
     e5 = "e5" in args.model
-    docs = [("passage: " if e5 else "") + (p["title"] + ". " + p["text"])[:3000] for p in pages]
-    E = model.encode(docs, normalize_embeddings=True, batch_size=16, show_progress_bar=True)
+    # Pages découpées en passages d'environ 300 mots (le modèle tronque au-delà de 512 tokens), le titre en tête de
+    # chaque passage ; le vecteur de la page est la moyenne de ses passages, pondérée par leur longueur.
+    chunks, owner, weight = [], [], []
+    for i, p in enumerate(pages):
+        words = p["text"].split()
+        for start in range(0, min(len(words), CHUNK_WORDS * MAX_CHUNKS), CHUNK_WORDS):
+            part = words[start:start + CHUNK_WORDS]
+            chunks.append(("passage: " if e5 else "") + p["topic"] + ". " + " ".join(part))
+            owner.append(i)
+            weight.append(len(part))
+    print(f"{len(chunks)} passages à encoder")
+    V = model.encode(chunks, normalize_embeddings=True, batch_size=16, show_progress_bar=True)
+    E = np.zeros((len(pages), V.shape[1]))
+    np.add.at(E, owner, V * np.array(weight)[:, None])
+    E /= np.linalg.norm(E, axis=1, keepdims=True)
 
-    # Un centre par langue (5 pages au moins) : une page traduite se compare aux pages de sa langue
+    # Un centre par langue (5 pages au moins) : une page traduite se compare aux pages de sa langue.
+    # Avec --core, le centre de chaque langue est la moyenne de ses pages cœur (à défaut, celles de tout le site).
     langs = np.array([p["lang"] for p in pages])
     counts = Counter(langs)
     if len(counts) > 1:
         print("Langues : " + ", ".join(f"{l or '?'} {n}" for l, n in counts.most_common()))
     groups = [np.where(langs == l)[0] for l, n in counts.items() if n >= 5]
     rest = np.where([counts[l] < 5 for l in langs])[0]
+    every = np.arange(len(pages))
+    base = every[is_core] if core_re else every
     focus, C = np.zeros(len(pages)), np.zeros_like(E)
     for g in groups + ([rest] if len(rest) else []):
-        mean = E[g].mean(0) if len(g) >= 5 else E.mean(0)
+        sel = g[is_core[g]] if core_re else g
+        if not (len(sel) >= 1 if core_re else len(sel) >= 5):
+            sel = base
+        mean = E[sel].mean(0)
         focus[g] = E[g] @ (mean / np.linalg.norm(mean))
         C[g] = E[g] - mean
-    p10, p25 = np.percentile(focus, [10, 25])
+    # Écart robuste à la médiane, en MAD (insensible aux pages extrêmes) : une page n'est signalée que si elle
+    # décroche vraiment, pas parce qu'elle fait partie des 10 % les plus bas.
+    med = np.median(focus)
+    mad = 1.4826 * np.median(np.abs(focus - med))
+    z = (focus - med) / max(mad, 1e-9)
     # Proximité entre pages sur les vecteurs centrés : sans le "fond commun" du site, les écarts redeviennent lisibles
     Cn = C / np.linalg.norm(C, axis=1, keepdims=True)
     S = Cn @ Cn.T
@@ -279,9 +368,14 @@ def main():
     print("== Cœur du site (les plus proches du centre) ==")
     for i in order[::-1][:5]:
         print(f"  {focus[i]:.3f}  {short(pages[i]['url'], root)}  {pages[i]['title'][:60]}")
-    print("\n== Loin du centre (10 % les plus bas) : supprimer, rattacher ou sortir du site ==")
-    for i in order[: max(3, len(pages) // 10)]:
-        print(f"  {focus[i]:.3f}  {short(pages[i]['url'], root)}  {pages[i]['title'][:60]}")
+    far = [i for i in order if z[i] <= -args.z]
+    print(f"\n== Loin du centre (écart ≤ -{args.z:g} MAD) : à croiser avec le trafic avant toute décision ==")
+    for i in far:
+        print(f"  {focus[i]:.3f}  z {z[i]:+.1f}  {short(pages[i]['url'], root)}  {pages[i]['title'][:60]}")
+    if not far:
+        print("  Aucune page ne décroche nettement. Les plus basses, pour information :")
+        for i in order[:3]:
+            print(f"  {focus[i]:.3f}  z {z[i]:+.1f}  {short(pages[i]['url'], root)}  {pages[i]['title'][:60]}")
 
     iu = np.triu_indices(len(pages), 1)
     pairs = S[iu]
@@ -290,13 +384,16 @@ def main():
         i, j = iu[0][k], iu[1][k]
         print(f"  {pairs[k]:.3f}  {short(pages[i]['url'], root)}  <->  {short(pages[j]['url'], root)}")
 
-    verdicts = ["loin du centre" if f <= p10 else "à surveiller" if f <= p25 else "cœur" for f in focus]
+    watch = 0.6 * args.z  # 1,5 MAD avec le seuil par défaut
+    verdicts = ["loin du centre" if v <= -args.z else "à surveiller" if v <= -watch else "cœur" for v in z]
+    print(f"\nVerdicts : {verdicts.count('cœur')} cœur, {verdicts.count('à surveiller')} à surveiller, {verdicts.count('loin du centre')} loin du centre")
     out = f"semfocus-{host(root)}.csv"
     with open(out, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["url", "titre", "focus", "verdict", "page la plus proche", "similarité"])
+        w.writerow(["url", "titre", "focus", "écart (MAD)", "verdict", "page cœur", "mots", "page la plus proche", "similarité"])
         for i in order:
-            w.writerow([pages[i]["url"], pages[i]["title"], f"{focus[i]:.4f}", verdicts[i], pages[near[i]]["url"], f"{S[i, near[i]]:.4f}"])
+            w.writerow([pages[i]["url"], pages[i]["title"], f"{focus[i]:.4f}", f"{z[i]:+.2f}", verdicts[i], "oui" if is_core[i] else "",
+                        len(pages[i]["text"].split()), pages[near[i]]["url"], f"{S[i, near[i]]:.4f}"])
     write_svg(f"semfocus-{host(root)}.svg", C, verdicts, pages, focus, root)
     print(f"\nTableau complet : {out}")
     print(f"Carte des pages : semfocus-{host(root)}.svg (à ouvrir dans le navigateur)")
