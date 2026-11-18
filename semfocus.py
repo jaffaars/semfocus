@@ -47,6 +47,7 @@ os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 http = requests.Session()
 http.headers["User-Agent"] = "Mozilla/5.0 (compatible; semfocus/1.0)"
 failures = Counter()  # pages non récupérées, par motif
+CACHE_VERSION = 2  # à augmenter quand le contenu d'une page en cache change de forme
 page_cache, cache_hits = {}, Counter()  # pages déjà téléchargées (adresse demandée -> page), reprises d'un passage précédent
 # Paramètres de suivi et de tri : la même page sous une autre adresse
 TRACKING = re.compile(r"^(utm_\w+|gclid|gbraid|wbraid|fbclid|msclkid|mc_cid|mc_eid|_ga|_gl|orderby|replytocom)$", re.I)
@@ -73,6 +74,35 @@ def get(url):
 
 def host(url):
     return urlparse(url).netloc.lower().removeprefix("www.")
+
+
+def normalize_lang(tag):
+    """Balise de langue complète, à la casse recommandée par BCP 47 : « pt_br » -> « pt-BR », « ZH-hans-cn » -> « zh-Hans-CN »."""
+    parts = [p for p in re.split(r"[-_]", (tag or "").strip()) if p]
+    if not parts or not re.fullmatch(r"[A-Za-z]{2,3}", parts[0]):
+        return ""
+    out = [parts[0].lower()]
+    for p in parts[1:]:
+        if len(p) == 1:  # extension ou usage privé (-x-..., -u-...) : la suite ne désigne plus une langue
+            break
+        if re.fullmatch(r"[A-Za-z]{4}", p):
+            out.append(p.title())  # écriture : Hans, Latn
+        elif re.fullmatch(r"[A-Za-z]{2}|\d{3}", p):
+            out.append(p.upper())  # région : BR, 419
+        else:
+            out.append(p.lower())
+    return "-".join(out)
+
+
+def language_groups(tags):
+    """Langue de regroupement de chaque page. Les variantes régionales restent séparées quand le site en a vraiment
+    plusieurs pour une même langue (pt-BR et pt-PT) ; un simple mélange de « fr » et « fr-FR », fréquent d'un gabarit
+    à l'autre, est ramené à « fr » pour ne pas couper le site en deux."""
+    variants = {}
+    for t in tags:
+        if "-" in t:
+            variants.setdefault(t.split("-")[0], set()).add(t)
+    return [t if len(variants.get(t.split("-")[0], ())) >= 2 else t.split("-")[0] for t in tags]
 
 
 def clean(url):
@@ -117,7 +147,7 @@ class Page(HTMLParser):
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         if tag == "html":
-            self.lang = (a.get("lang") or "")[:2].lower()
+            self.lang = normalize_lang(a.get("lang"))
         if tag == "a" and a.get("href"):
             self.links.append(a["href"])
             if not self.skip:  # lien placé dans le contenu, hors menus, en-tête, pied de page et colonnes
@@ -186,7 +216,7 @@ def fetch(url):
     elsewhere = bool(canonical) and not same_page(canonical, r.url)
     page = {"url": clean(r.url), "title": " ".join(p.title.split()), "blocks": blocks, "links": links,
             "body_links": body_links, "noindex": noindex, "canonical_elsewhere": elsewhere, "lang": p.lang,
-            "fetched": time.time()}
+            "fetched": time.time(), "cache": CACHE_VERSION}
     page_cache[url] = page
     return page
 
@@ -198,7 +228,7 @@ def load_page_cache(path, hours):
     except (OSError, ValueError):
         return
     limit = time.time() - hours * 3600
-    page_cache.update({u: p for u, p in data.items() if p.get("fetched", 0) >= limit and "body_links" in p})
+    page_cache.update({u: p for u, p in data.items() if p.get("fetched", 0) >= limit and p.get("cache") == CACHE_VERSION})
 
 
 def save_page_cache(path):
@@ -434,7 +464,7 @@ def main():
 
     # Un centre par langue (5 pages au moins) : une page traduite se compare aux pages de sa langue.
     # Avec --core, le centre de chaque langue est la moyenne de ses pages cœur (à défaut, celles de tout le site).
-    langs = np.array([p["lang"] for p in pages])
+    langs = np.array(language_groups([p["lang"] for p in pages]))
     counts = Counter(langs)
     if len(counts) > 1:
         print("Langues : " + ", ".join(f"{l or '?'} {n}" for l, n in counts.most_common()))

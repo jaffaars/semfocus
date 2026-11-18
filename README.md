@@ -23,6 +23,8 @@ Everything runs locally and for free: no API key, no account.
 4. **Computes the centre** of the site (one centre per language on multilingual sites) and, for every page,
    `focus = cos(page, centre)`. The radius is `mean(1 - focus)`. With `--core`, the centre is the mean of the pages
    you choose (home, product pages...) instead of the mean of the whole site, which outliers would pull towards them.
+   Languages come from the `lang` attribute, kept as a full BCP 47 tag: regional variants stay apart when the site
+   really has several for one language (`pt-BR` and `pt-PT`), while a mere mix of `fr` and `fr-FR` is grouped as `fr`.
 5. **Flags the outliers** with a robust deviation from the median, in MADs (median absolute deviation): a page is
    "far from the centre" only if it really drops out (default: 2.5 MADs below the median), so a well-focused site
    gets no false alarm. The deviation is computed language by language. On template-driven sites, where pages are
